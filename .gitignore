@@ -1,0 +1,7 @@
+# Compiled object files
+*.o
+# Build artifacts
+*.out
+*.log
+# Compiled binary
+sender
