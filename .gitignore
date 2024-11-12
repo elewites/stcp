@@ -5,3 +5,6 @@
 *.log
 # Compiled binary
 sender
+testtcp
+testwraparound
+waitForPorts

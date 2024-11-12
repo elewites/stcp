@@ -32,10 +32,13 @@
 typedef struct {
 
 
-    int DELETE_ME;     /* used only to make this compile */
-
-    /* YOUR CODE HERE */
-
+    int socket;
+    int state;
+    unsigned int seqNo; // current sequence number for sending packets
+    unsigned int ackNo; // current ack number for receiving packets
+    int timeout;        // timeout duration for retranmission
+    unsigned short windowSize; // receiver's window size
+    
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
 
@@ -77,15 +80,116 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
  * very good for a pure request response protocol like DNS where there
  * is no long term relationship between the client and server.
  */
-stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
-                             int receiversPort) {
+// stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
+//                              int receiversPort) {
 
+//     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
+//     // Step 1 open upd connection
+//     int fd = udp_open(destination, receiversPort, sendersPort);
+//     // Step 2 create control block
+//     stcp_send_ctrl_blk *cb = malloc(sizeof(stcp_send_ctrl_blk));
+//     if (!cb) {
+//         logLog("failure", "Failed to allocate memory for control block");
+//         return NULL;
+//     }
+//     // Step 3 initialize control block
+//     cb->socket = fd;
+//     cb->state = STCP_SENDER_SYN_SENT;
+//     cb->seqNo = random() % STCP_MAXWIN;
+//     cb->ackNo = 0;
+//     // initialize timeout
+//     cb->timeout = STCP_INITIAL_TIMEOUT;
+//     // step 4 prepare and send syn packet
+//     packet syn_packet;
+//     createSegment(&syn_packet, SYN, STCP_MAXWIN, cb->seqNo, cb->ackNo, NULL, 0);
+//     setSyn(syn_packet->hdr);
+//     syn_packet.hdr->checksum = ipchecksum(&syn_packet.data, sizeof(tcpheader));
+//     // send the packet
+//     if (send(cb->socket, &syn_packet, syn_packet.len, 0) < 0) {
+//         logLog("failure", "Failed to send SYN packet");
+//         free(cb);
+//         close(fd);
+//         return NULL;
+//     }
+//     // readWithTimeout(cb->socket, &syn_packet, STCP_INITIAL_TIMEOUT);
+//     return NULL;
+// }
+stcp_send_ctrl_blk *stcp_open(char *destination, int sendersPort, int receiversPort) {
+    // Log the connection attempt
     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
-    // Since I am the sender, the destination and receiversPort name the other side
+
+    // Step 1: Open a UDP connection
     int fd = udp_open(destination, receiversPort, sendersPort);
-    (void) fd;
-    /* YOUR CODE HERE */
-    return NULL;
+    if (fd < 0) {
+        logLog("failure", "Failed to open UDP connection");
+        return NULL;
+    }
+
+    // Step 2: Allocate and initialize control block
+    stcp_send_ctrl_blk *cb = malloc(sizeof(stcp_send_ctrl_blk));
+    if (!cb) {
+        logLog("failure", "Failed to allocate memory for control block");
+        close(fd);
+        return NULL;
+    }
+
+    cb->socket = fd;
+    cb->state = STCP_SENDER_SYN_SENT;
+    cb->seqNo = random() % STCP_MAXWIN;  // Generate initial sequence number
+    cb->ackNo = 0;
+    cb->timeout = STCP_INITIAL_TIMEOUT;
+
+    // Step 3: Prepare and send SYN packet
+    packet syn_packet;
+    createSegment(&syn_packet, SYN, STCP_MAXWIN, cb->seqNo, cb->ackNo, NULL, 0);
+    setSyn(syn_packet.hdr); // Set SYN flag
+    dump('s', syn_packet.data, syn_packet.len);
+    htonHdr(syn_packet.hdr);  // Convert header to network byte order
+    syn_packet.hdr->checksum = ipchecksum(syn_packet.data, syn_packet.len);
+    logLog("init", "Sending SYN packet to %s:%d", destination, receiversPort);
+    if (send(cb->socket, syn_packet.data, syn_packet.len, 0) < 0) {
+        logLog("failure", "Failed to send SYN packet");
+        free(cb);
+        close(fd);
+        return NULL;
+    }
+
+    // Step 4: Wait for SYN-ACK
+    packet recvPacket;
+    int readStatus = readWithTimeout(cb->socket, recvPacket.data, STCP_INITIAL_TIMEOUT);
+    if (readStatus <= 0) {
+        logLog("failure", "Timed out or failed to receive SYN-ACK");
+        free(cb);
+        close(fd);
+        return NULL;
+    }
+    // Step 5: Validate SYN-ACK
+    recvPacket.hdr = (tcpheader *)recvPacket.data;
+    ntohHdr(recvPacket.hdr); // Convert header to host byte order
+    if (!(getAck(recvPacket.hdr) && recvPacket.hdr->ackNo == cb->seqNo + 1 && getSyn(recvPacket.hdr))) {
+        logLog("failure", "Invalid SYN-ACK received");
+        free(cb);
+        close(fd);
+        return NULL;
+    }
+    cb->state = STCP_SENDER_ESTABLISHED;
+    cb->ackNo = recvPacket.hdr->seqNo + 1;
+    cb->seqNo = cb->seqNo + 1;
+    logLog("init", "Connection established with %s:%d", destination, receiversPort);
+
+    // Step 6: Send ACK to complete handshake
+    packet ack_packet;
+    createSegment(&ack_packet, ACK, STCP_MAXWIN, cb->seqNo, cb->ackNo, NULL, 0);
+    setAck(ack_packet.hdr); // Set ACK flag
+    htonHdr(ack_packet.hdr); // Convert header to network byte order
+    ack_packet.hdr->checksum = ipchecksum(ack_packet.data, ack_packet.len);
+    if (send(cb->socket, ack_packet.data, ack_packet.len, 0) < 0) {
+        logLog("failure", "Failed to send final ACK packet");
+        free(cb);
+        close(fd);
+        return NULL;
+    }
+    return cb;
 }
 
 
@@ -132,7 +236,7 @@ int main(int argc, char **argv) {
     unsigned char buffer[STCP_MSS];
     int num_read_bytes;
 
-    logConfig("sender", "init,segment,error,failure");
+    logConfig("sender", "init,segment,packet,error,failure");
     /* Verify that the arguments are right */
     if (argc > 5 || argc == 1) {
         fprintf(stderr, "usage: sender DestinationIPAddress/Name receiveDataOnPort sendDataToPort filename\n");
@@ -163,7 +267,10 @@ int main(int argc, char **argv) {
      */
     cb = stcp_open(destinationHost, sendersPort, receiversPort);
     if (cb == NULL) {
-        /* YOUR CODE HERE */
+        logLog("failure", "Could not open connection to %s:%d", destinationHost, receiversPort);
+        fprintf(stderr, "Could not open connection to %s:%d\n", destinationHost, receiversPort);
+        close(file);
+        exit(1);
     }
 
     /* Start to send data in file via STCP to remote receiver. Chop up
