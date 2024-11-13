@@ -57,11 +57,58 @@ typedef struct {
  *
  * The function returns STCP_SUCCESS on success, or STCP_ERROR on error.
  */
-int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
+stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char *data, int length) {
+    // INCORRECT IMPLEMENTATION
+    return STCP_SUCCESS;
 
-    /* YOUR CODE HERE */
+    int bytes_sent = 0;
+    int send_status, ack_status;
+    unsigned char segment[STCP_MTU];  // Buffer to hold one segment (header + data)
+    packet pkt;
+
+    // Set an initial timeout value if not already set
+    if (stcp_CB->timeout == 0) {
+        stcp_CB->timeout = STCP_INITIAL_TIMEOUT;
+    }
+
+    while (bytes_sent < length) {
+        // Determine how much data to send in this segment
+        int data_to_send = min(STCP_MSS, length - bytes_sent);
+        // Create the segment using createSegment
+        createSegment(&pkt, 0, stcp_CB->windowSize, stcp_CB->seqNo, stcp_CB->ackNo, data + bytes_sent, data_to_send);
+        // Copy the created segment into the send buffer
+        memcpy(segment, pkt.data, pkt.len);
+        // Step 1: Send the segment
+        send_status = send(stcp_CB->socket, segment, pkt.len, 0);
+        if (send_status < 0) {
+            logLog("failure", "Failed to send segment");
+            return STCP_ERROR;
+        }
+        // Step 2: Wait for ACK with a timeout using stcp_CB->timeout
+        unsigned char ack_buffer[STCP_MTU];
+        ack_status = readWithTimeout(stcp_CB->socket, ack_buffer, stcp_CB->timeout);
+        if (ack_status > 0) {
+            tcpheader *ack_hdr = (tcpheader *)ack_buffer;
+            ntohHdr(ack_hdr);  // Convert ACK header to host byte order
+            // Check if the received ACK acknowledges the data we sent
+            if (ack_hdr->ackNo == htonl(stcp_CB->seqNo + data_to_send)) {
+                // ACK received for this segment
+                bytes_sent += data_to_send;
+                stcp_CB->seqNo += data_to_send;  // Update sequence number for the next send
+                stcp_CB->timeout = STCP_INITIAL_TIMEOUT;  // Reset timeout on successful send
+            } else {
+                // Unexpected ACK, increase timeout for retransmission
+                stcp_CB->timeout = stcpNextTimeout(stcp_CB->timeout);
+            }
+        } else {
+            // Timeout or no ACK received, increase timeout for retransmission
+            stcp_CB->timeout = stcpNextTimeout(stcp_CB->timeout);
+            logLog("warning", "Timeout or incorrect ACK, increasing timeout and retrying...");
+        }
+    }
     return STCP_SUCCESS;
 }
+
 
 
 
@@ -80,40 +127,6 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
  * very good for a pure request response protocol like DNS where there
  * is no long term relationship between the client and server.
  */
-// stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
-//                              int receiversPort) {
-
-//     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
-//     // Step 1 open upd connection
-//     int fd = udp_open(destination, receiversPort, sendersPort);
-//     // Step 2 create control block
-//     stcp_send_ctrl_blk *cb = malloc(sizeof(stcp_send_ctrl_blk));
-//     if (!cb) {
-//         logLog("failure", "Failed to allocate memory for control block");
-//         return NULL;
-//     }
-//     // Step 3 initialize control block
-//     cb->socket = fd;
-//     cb->state = STCP_SENDER_SYN_SENT;
-//     cb->seqNo = random() % STCP_MAXWIN;
-//     cb->ackNo = 0;
-//     // initialize timeout
-//     cb->timeout = STCP_INITIAL_TIMEOUT;
-//     // step 4 prepare and send syn packet
-//     packet syn_packet;
-//     createSegment(&syn_packet, SYN, STCP_MAXWIN, cb->seqNo, cb->ackNo, NULL, 0);
-//     setSyn(syn_packet->hdr);
-//     syn_packet.hdr->checksum = ipchecksum(&syn_packet.data, sizeof(tcpheader));
-//     // send the packet
-//     if (send(cb->socket, &syn_packet, syn_packet.len, 0) < 0) {
-//         logLog("failure", "Failed to send SYN packet");
-//         free(cb);
-//         close(fd);
-//         return NULL;
-//     }
-//     // readWithTimeout(cb->socket, &syn_packet, STCP_INITIAL_TIMEOUT);
-//     return NULL;
-// }
 stcp_send_ctrl_blk *stcp_open(char *destination, int sendersPort, int receiversPort) {
     // Log the connection attempt
     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
@@ -143,7 +156,7 @@ stcp_send_ctrl_blk *stcp_open(char *destination, int sendersPort, int receiversP
     packet syn_packet;
     createSegment(&syn_packet, SYN, STCP_MAXWIN, cb->seqNo, cb->ackNo, NULL, 0);
     setSyn(syn_packet.hdr); // Set SYN flag
-    dump('s', syn_packet.data, syn_packet.len);
+    // dump('s', syn_packet.data, syn_packet.len);
     htonHdr(syn_packet.hdr);  // Convert header to network byte order
     syn_packet.hdr->checksum = ipchecksum(syn_packet.data, syn_packet.len);
     logLog("init", "Sending SYN packet to %s:%d", destination, receiversPort);
@@ -165,13 +178,23 @@ stcp_send_ctrl_blk *stcp_open(char *destination, int sendersPort, int receiversP
     }
     // Step 5: Validate SYN-ACK
     recvPacket.hdr = (tcpheader *)recvPacket.data;
+    // Validate checksum
+    // if (ipchecksum(recvPacket.data, recvPacket.len) != 0) {
+    //     logLog("failure", "Invalid checksum in received SYN-ACK");
+    //     free(cb);
+    //     close(fd);
+    //     return NULL;
+    // }
     ntohHdr(recvPacket.hdr); // Convert header to host byte order
+    // dump('r', recvPacket.data, readStatus);
     if (!(getAck(recvPacket.hdr) && recvPacket.hdr->ackNo == cb->seqNo + 1 && getSyn(recvPacket.hdr))) {
         logLog("failure", "Invalid SYN-ACK received");
         free(cb);
         close(fd);
         return NULL;
     }
+    // Update control block with receiver's window size
+    cb->windowSize = recvPacket.hdr->windowSize;
     cb->state = STCP_SENDER_ESTABLISHED;
     cb->ackNo = recvPacket.hdr->seqNo + 1;
     cb->seqNo = cb->seqNo + 1;
